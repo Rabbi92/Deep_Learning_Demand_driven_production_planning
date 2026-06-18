@@ -111,7 +111,7 @@ def forecast_demand(hist, horizon):
     feat = feat.dropna(subset=FEATURES)
     out = {}
     if model is not None and xscaler is not None and yscaler is not None:
-        fs = feat.copy(); fs[allx] = xscaler.transform(feat[allx])
+        fs = feat.copy(); fs[allx] = xscaler.transform(feat[allx].values)
         look = CFG["LOOKBACK"]
         for pid in PRODUCTS:
             g = fs[fs.product_code == pid].sort_values("date")
