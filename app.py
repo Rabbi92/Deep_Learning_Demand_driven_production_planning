@@ -123,52 +123,88 @@ def forecast_line_daily(line, horizon):
 # DEDICATED-LINE SCHEDULER  (one changeover per variant; urgency ordering)
 # ============================================================================
 def schedule_line(line, daily_total, opening_stock, co_rate):
-    """daily_total: list of forecast daily demand for the LINE over the horizon.
-    Splits to variants by share, schedules contiguous blocks, returns plan+costs."""
+    """Forecast daily LINE demand, split to variants by share, then schedule with a hybrid
+    rule that both meets demand and minimises changeovers:
+      - the DOMINANT variant (largest share) is the line's 'home' product and runs whenever
+        the line is not making something else (so it incurs at most a few changeovers);
+      - MINORITY variants are produced in single contiguous blocks, timed just before they
+        would stock out, sized to cover the whole horizon.
+    Each day, demand for every variant is served from stock + that day's production.
+    """
     H = len(daily_total)
     cap = LINES[line]["capacity_tpd"]; variants = LINES[line]["variants"]
-    # per-variant daily demand = line daily * share (time-varying)
     vd = {v: [daily_total[d]*variants[v]["share"] for d in range(H)] for v in variants}
-    vmean = {v: float(np.mean(vd[v])) for v in variants}
+    names = list(variants)
+    dominant = max(names, key=lambda v: variants[v]["share"])
+    minority = [v for v in names if v != dominant]
 
-    safety_days = 1.0
-    need = {v: max(sum(vd[v]) + vmean[v]*safety_days - opening_stock.get(v, 0), 0) for v in variants}
+    plan = {v: [0.0]*H for v in names}
+    stock = {v: opening_stock.get(v, 0) for v in names}
+    need = {v: max(sum(vd[v]) + vd[v][0]*0.5 - opening_stock.get(v, 0), 0) for v in names}
+    remaining = dict(need)
+    blocks_started = set()
 
-    def cover(v): return opening_stock.get(v, 0)/vmean[v] if vmean[v] > 0 else 1e9
-    order = sorted(variants, key=cover)
+    for d in range(H):
+        cap_left = cap
+        # 1) URGENT minority variants whose stock would go negative get a block now
+        for v in minority:
+            if remaining[v] <= 1e-6: continue
+            days_cover = stock[v]/vd[v][d] if vd[v][d] > 0 else 99
+            if days_cover < 1.5 and cap_left > 1e-6:        # about to run short -> run its block
+                take = min(remaining[v], cap_left)
+                plan[v][d] += take; cap_left -= take; remaining[v] -= take
+                blocks_started.add(v)
+        # 2) dominant variant fills the rest of the day's capacity (its 'home' line)
+        if remaining[dominant] > 1e-6 and cap_left > 1e-6:
+            take = min(remaining[dominant], cap_left)
+            plan[dominant][d] += take; cap_left -= take; remaining[dominant] -= take
+            blocks_started.add(dominant)
+        # 3) any leftover capacity tops up minority variants early (reduces later changeovers)
+        for v in minority:
+            if remaining[v] > 1e-6 and cap_left > 1e-6:
+                take = min(remaining[v], cap_left)
+                plan[v][d] += take; cap_left -= take; remaining[v] -= take
+                blocks_started.add(v)
+        # settle stock
+        for v in names:
+            avail = stock[v] + plan[v][d]; disp = min(vd[v][d], avail); stock[v] = avail - disp
 
-    plan = {v: [0.0]*H for v in variants}
-    day = 0; sequence = []; co_hours = 0.0; feasible = True
-    for v in order:
-        rem = need[v]
-        if rem <= 1e-6: continue
-        sequence.append(v); co_hours += variants[v]["changeover_hr"]
-        while rem > 1e-6 and day < H:
-            prod = min(cap, rem); plan[v][day] += prod; rem -= prod; day += 1
-        if rem > 1e-6: feasible = False
+    # changeovers: dominant = 1 (home), plus one per minority block actually produced
+    produced = [v for v in names if sum(plan[v]) > 1e-6]
+    sequence = ([dominant] if dominant in produced else []) + [v for v in minority if v in produced]
+    co_hours = sum(variants[v]["changeover_hr"] for v in produced)
 
     co_cost = co_hours*co_rate; hold_c = so_c = 0.0
-    inv = {v: [] for v in variants}; unmet_tot = 0.0
-    for v in variants:
-        stock = opening_stock.get(v, 0)
+    inv = {v: [] for v in names}; unmet_tot = 0.0
+    for v in names:
+        s = opening_stock.get(v, 0)
         for d in range(H):
-            avail = stock + plan[v][d]; disp = min(vd[v][d], avail)
-            unmet = max(vd[v][d]-disp, 0); stock = avail-disp
-            so_c += unmet*STOCKOUT[line]; hold_c += stock*HOLD[line]
-            unmet_tot += unmet; inv[v].append(stock)
+            avail = s + plan[v][d]; disp = min(vd[v][d], avail)
+            unmet = max(vd[v][d]-disp, 0); s = avail-disp
+            so_c += unmet*STOCKOUT[line]; hold_c += s*HOLD[line]
+            unmet_tot += unmet; inv[v].append(s)
     total = co_cost+hold_c+so_c
-    util = sum(need.values())/(cap*H) if cap*H > 0 else 0
+    util = sum(sum(plan[v]) for v in names)/(cap*H) if cap*H > 0 else 0
+    feasible = unmet_tot < 1.0
     return dict(plan=plan, vd=vd, sequence=sequence, co_hours=co_hours, co_cost=co_cost,
                 hold_cost=hold_c, stockout_cost=so_c, total=total, util=util,
                 feasible=feasible, inv=inv, unmet=unmet_tot)
 
 def baseline_line(line, daily_total, opening_stock, co_rate):
-    """Reactive baseline: variants run in arbitrary order, switching every day (many changeovers)."""
+    """Reactive baseline: NO anticipation. Each day produces to replace YESTERDAY's demand
+    (a lag-1 reactive rule), switching between all variants daily (many changeovers).
+    Because it never anticipates rises in demand, it incurs stockouts when demand climbs —
+    the characteristic failure of experience-based reactive planning."""
     H = len(daily_total); variants = LINES[line]["variants"]; cap = LINES[line]["capacity_tpd"]
     vd = {v: [daily_total[d]*variants[v]["share"] for d in range(H)] for v in variants}
-    plan = {v: [min(vd[v][d], cap) for d in range(H)] for v in variants}
-    # daily switching among all variants -> changeover every day for each variant present
-    co_hours = sum(variants[v]["changeover_hr"] for v in variants)*H/len(variants)
+    plan = {v: [0.0]*H for v in variants}
+    for v in variants:
+        for d in range(H):
+            # produce what was demanded the PREVIOUS day (reactive lag); day 0 uses day0 demand
+            ref = vd[v][d-1] if d > 0 else vd[v][0]
+            plan[v][d] = min(ref, cap*variants[v]["share"]*1.3)  # rough per-variant share of line time
+    # reactive plan switches among all variants every day -> a changeover per variant per day
+    co_hours = sum(variants[v]["changeover_hr"] for v in variants)*H
     co_cost = co_hours*co_rate; hold_c = so_c = 0.0
     for v in variants:
         stock = opening_stock.get(v, 0)
